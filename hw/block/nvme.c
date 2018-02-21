@@ -1997,8 +1997,8 @@ static uint16_t nvme_get_log(NvmeCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd)
     /* NVMe R1.3 */
     numdl = (dw10 >> 16) << 2;
     numdu = (dw11 & 0xffff) << 2;
-    lpol = dw12 << 2;
-    lpou = dw13 << 2;
+    lpol = dw12;
+    lpou = dw13;
 
     len = numdl + numdu;
     off = lpol + lpou;

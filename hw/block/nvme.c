@@ -1368,55 +1368,172 @@ static void lnvm_chunk_meta_init(LnvmCtrl *ln, LnvmCS *chunk_meta,
     }
 }
 
+static const char *state_id_to_str(int state) {
+    switch (state) {
+        case LNVM_CHUNK_FREE: return "FREE";
+        case LNVM_CHUNK_OPEN: return "OPEN";
+        case LNVM_CHUNK_CLOSED: return "CLOSED";
+        case LNVM_CHUNK_BAD: return "OFFLINE";
+        default: return "UNDEFINED";
+    }
+}
+
 static void lnvm_chunk_meta_save(NvmeNamespace *ns)
 {
     LnvmCtrl *ln = &ns->ctrl->lnvm_ctrl;
     LnvmCS *chunk_meta = ns->chunk_meta;
-    uint32_t nr_chunks = ln->params.total_chks;
+    int index, ch, lun, chk;
+    int ret;
     FILE *fp;
 
     if (!ln->chunk_fname) {
         fprintf(stderr, "nvme: could not save chunk metadata. File does not exist\n");
-        return;
+        goto fail_free_chunk_meta;
     }
 
     if (ln->state_auto_gen) {
         fp = fopen(ln->chunk_fname, "w+");
         if (!fp) {
             fprintf(stderr, "nvme: could not save chunk metadata. Cannot open file\n");
-            return;
+	    goto fail_free_chunk_meta;
         }
     } else {
         fp = fopen(ln->chunk_fname, "r+");
         if (!fp) {
             fprintf(stderr, "nvme: could not save chunk metadata. Cannot open file\n");
-            return;
+	    goto fail_free_chunk_meta;
         }
     }
 
-    if (fwrite(chunk_meta, sizeof(LnvmCS), nr_chunks, fp) != nr_chunks) {
-        fprintf(stderr, "nvme: could not save chunk metadata. Cannot write to file\n");
-        return;
+    for (ch = 0; ch < ln->params.num_ch; ch++) {
+        for (lun = 0; lun < ln->params.num_lun; lun ++) {
+	    for (chk = 0; chk < ln->id_ctrl.geo.num_chk; chk++) {
+		index = ln->id_ctrl.geo.num_chk * (ch * ln->params.num_lun + lun) + chk;
+		ret = fprintf(fp, "grp=%d pu=%d chk=%d wp=%lu wi=%d type=W_SEQ status=%s\n",
+				ch, lun, chk,
+				chunk_meta[index].wp,
+				chunk_meta[index].wear_index,
+				state_id_to_str(chunk_meta[index].state));
+
+		if (ret) {
+			fprintf(stderr, "nvme: could not save chunk metadata. Cannot write to file\n");
+			goto fail_close_fp;
+		}
+	    }
+	}
     }
 
+fail_close_fp:
     fclose(fp);
+fail_free_chunk_meta:
     free(ns->chunk_meta);
 }
 
-static int lnvm_chunk_meta_load(NvmeNamespace *ns, uint32_t offset,
+
+static unsigned get_unsigned(char *string, const char *key, unsigned int *value) {
+    char *keyvalue=strstr(string, key);
+    if (!keyvalue)
+	    return 1;
+    return sscanf(keyvalue + strlen(key), "%u", value);
+}
+
+static unsigned get_str(char *string, const char *key, char *value, size_t len) {
+    char *keyvalue=strstr(string, key);
+    char format[32];
+
+    if (!keyvalue)
+	    return 1;
+
+    if (len == 0)
+        return 1;
+
+    snprintf(format, (int)sizeof(format), "%%%ds", (int)len - 1);
+
+    return sscanf(keyvalue + strlen(key), format, value);
+}
+
+static int get_state_id(char *state) {
+
+    if (!strcmp(state, "FREE"))
+        return LNVM_CHUNK_FREE;
+
+    if (!strcmp(state, "OFFLINE"))
+        return LNVM_CHUNK_BAD;
+
+    if (!strcmp(state, "OPEN"))
+        return LNVM_CHUNK_OPEN;
+
+    if (!strcmp(state, "CLOSED"))
+        return LNVM_CHUNK_CLOSED;
+
+   return -1;
+}
+
+static int update_chunk(char *chunkinfo, NvmeNamespace *ns)
+{
+    struct LnvmCtrl *ln = &ns->ctrl->lnvm_ctrl;
+    LnvmCS *chunk_meta = ns->chunk_meta;
+    unsigned int ch=1, lun, chk, wp, wi;
+    char status[16] = {0};
+    char type[16] = {0};
+    unsigned int index;
+    int state_id;
+
+    if (!get_unsigned(chunkinfo, "grp=", &ch))
+	    return 1;
+
+    if (!get_unsigned(chunkinfo, "pu=", &lun))
+	    return 1;
+
+    if (!get_unsigned(chunkinfo, "chk=", &chk))
+	    return 1;
+
+    if (!get_unsigned(chunkinfo, "wi=", &wi))
+	    return 1;
+
+    if (!get_unsigned(chunkinfo, "wp=", &wp))
+	    return 1;
+
+    if (!get_str(chunkinfo, "state=", status, sizeof(type)))
+	    return 1;
+
+    /* Ony W_SEQ chunks are supported */
+    if (!get_str(chunkinfo, "type=", type, sizeof(type)) || strcmp(type, "W_SEQ") != 0)
+	    return 1;
+
+    if (chk >= ln->id_ctrl.geo.num_chk)
+	    return 1;
+
+    if (lun >= ln->params.num_lun)
+	    return 1;
+
+    if (ch >= ln->params.num_ch)
+	   return 1;
+
+    state_id = get_state_id(status);
+
+    if (state_id < 0)
+	    return 1;
+
+    index = ln->id_ctrl.geo.num_chk*(ch*ln->params.num_lun + lun) + chk;
+
+    chunk_meta[index].state=state_id;
+    chunk_meta[index].wear_index=wi;
+    chunk_meta[index].wp=wp;
+
+    return 0;
+}
+static int lnvm_chunk_meta_load(NvmeNamespace *ns,
                                 uint32_t nr_chunks)
 {
     struct LnvmCtrl *ln = &ns->ctrl->lnvm_ctrl;
     LnvmCS *chunk_meta = ns->chunk_meta;
-    struct stat buf;
+    char line[256];
     FILE *fp;
-    size_t chunk_tbytes;
-    size_t ret;
 
-    chunk_tbytes = sizeof(LnvmCS) * ln->params.total_chks;
+    lnvm_chunk_meta_init(ln, chunk_meta, nr_chunks);
 
     if (!ln->chunk_fname) {
-        lnvm_chunk_meta_init(ln, chunk_meta, nr_chunks);
         return 0;
     }
 
@@ -1426,27 +1543,9 @@ static int lnvm_chunk_meta_load(NvmeNamespace *ns, uint32_t offset,
         return -1;
     }
 
-    if (fstat(fileno(fp), &buf)) {
-        error_report("nvme: lnvm_chunk_meta_load: fstat(%s)\n", ln->chunk_fname);
-        return -1;
-    }
-
-    if (buf.st_size == chunk_tbytes) {
-        if (fseek(fp, offset, SEEK_SET)) {
-            fprintf(stderr, "nvme: could not seek chunk metadata\n");
-            return -1;
-        }
-
-        ret = fread(chunk_meta, sizeof(LnvmCS), nr_chunks, fp);
-        if (ret != nr_chunks) {
-            fprintf(stderr, "nvme: could not read chunk metadata\n");
-            return -1;
-        }
-    } else {
-        lnvm_chunk_meta_init(ln, chunk_meta, nr_chunks);
-
-        if (fwrite(chunk_meta, sizeof(LnvmCS), nr_chunks, fp) != nr_chunks)
-            fprintf(stderr, "nvme: could not save chunk metadata. Cannot write to file\n");
+    while (fgets(line, sizeof(line), fp)) {
+	if (update_chunk(line, ns))
+	    fprintf(stderr, "error parsing chunk state line: %s", line);
     }
 
     fclose(fp);
@@ -2887,7 +2986,7 @@ static int lnvm_init(NvmeCtrl *n)
             return -ENOMEM;
 
         memset(ns->chunk_meta, 0, ln->params.total_chks* sizeof(LnvmCS));
-        ret = lnvm_chunk_meta_load(ns, 0, ln->params.total_chks);
+        ret = lnvm_chunk_meta_load(ns, ln->params.total_chks);
         if (ret)
             return ret;
     }
@@ -3126,7 +3225,7 @@ static Property nvme_props[] = {
     DEFINE_PROP_UINT8("lmw_cunits", NvmeCtrl, lnvm_ctrl.params.mw_cunits, 32),
     DEFINE_PROP_UINT32("lnum_ch", NvmeCtrl, lnvm_ctrl.params.num_ch, 1),
     DEFINE_PROP_UINT32("lnum_pu", NvmeCtrl, lnvm_ctrl.params.num_lun, 1),
-    DEFINE_PROP_STRING("lchunktable", NvmeCtrl, lnvm_ctrl.chunk_fname),
+    DEFINE_PROP_STRING("lchunktable_txt", NvmeCtrl, lnvm_ctrl.chunk_fname),
     DEFINE_PROP_STRING("lmetadata", NvmeCtrl, lnvm_ctrl.meta_fname),
     DEFINE_PROP_UINT32("lb_err_write", NvmeCtrl, lnvm_ctrl.err_write, 0),
     DEFINE_PROP_UINT32("ln_err_write", NvmeCtrl, lnvm_ctrl.n_err_write, 0),

@@ -929,6 +929,7 @@ typedef struct NvmeRequest {
     uint64_t                mptr;
     void                    *meta_buf;
     uint64_t                lnvm_slba;
+    uint64_t		    *lnvm_ppa_list;
     NvmeCqe                 cqe;
     BlockAcctCookie         acct;
     QEMUSGList              qsg;
@@ -1004,6 +1005,7 @@ typedef struct NvmeNamespace {
     uint64_t        start_block;
     LnvmCS          *chunk_meta;
     uint8_t         *resetfail;
+    uint8_t         *writefail;
 } NvmeNamespace;
 
 #define TYPE_NVME "nvme"
@@ -1022,9 +1024,7 @@ typedef struct LnvmCtrl {
     char           *meta_fname;
     char           *chunk_fname;
     char           *resetfail_fname;
-    uint32_t       err_write;
-    uint32_t       n_err_write;
-    uint32_t       err_write_cnt;
+    char           *writefail_fname;
     FILE           *metadata;
     uint8_t        int_meta_size;       // # of bytes for "internal" metadata
     uint8_t        lba_meta_size; /* per lba metadata */

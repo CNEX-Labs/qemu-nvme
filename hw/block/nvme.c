@@ -513,6 +513,7 @@ static void lnvm_inject_w_err(LnvmCtrl *ln, NvmeRequest *req, NvmeCqe *cqe)
 	        bitmap_set(&cqe->res64, i, 1);
                 req->status = 0x40ff; /* FAIL WRITE status code */
                 chunk_meta->state = LNVM_CHUNK_BAD;
+		chunk_meta->wp--;
 
 		if (ln->debug) {
 		    printf("Injecting write error for ppa:\n");
@@ -1028,6 +1029,28 @@ static uint16_t lnvm_rw_free_rq(uint64_t *aio_sector_list)
         return NVME_INVALID_FIELD | NVME_DNR;
 }
 
+static uint16_t lnvm_rw_check_chunk_read(NvmeCtrl *n, LnvmCtrl *ln,
+    NvmeNamespace *ns, uint64_t slba, uint32_t nlba)
+{
+    LnvmCS *chunk_meta = lnvm_chunk_get_state(ns, ln, slba);
+
+    if (chunk_meta) {
+        uint64_t wp = chunk_meta->wp;
+
+        uint64_t end_sectr = ((slba & ln->lbaf.sec_mask) >>
+                                               ln->lbaf.sec_offset) + (nlba-1);
+
+	if (wp < end_sectr /*&& chunk_meta->state == LNVM_CHUNK_BAD*/) {
+		fprintf(stderr,
+			"nvme: wp check failed sec: %lu wp: %lu\n", end_sectr, wp);
+		return 0;
+	}
+    }
+
+    return 1;
+}
+
+
 static uint16_t lnvm_rw_setup_rq(NvmeCtrl *n, NvmeNamespace *ns, LnvmRwCmd *lrw,
                 uint64_t **aio_sector_list, NvmeRequest *req,
                 uint64_t *psl, uint64_t data_shift, uint32_t nlb)
@@ -1070,6 +1093,15 @@ static uint16_t lnvm_rw_setup_rq(NvmeCtrl *n, NvmeNamespace *ns, LnvmRwCmd *lrw,
         lba_off = lnvm_lba_to_off(ln, psl[i]);
         (*aio_sector_list)[i] =
                 ns->start_block + (lba_off << (data_shift - BDRV_SECTOR_BITS));
+
+	if (!req->is_write) {
+		if (!lnvm_rw_check_chunk_read(n, ln, ns,  psl[i], 1)) {
+			fprintf(stderr, "lnvm_rw: read ahead of wp\n");
+	                print_ppa(ln, psl[i]);
+	                err = NVME_INVALID_FIELD | NVME_DNR;
+		        goto fail_free_msl;
+		}
+	}
 
         if (req->is_write) {
             req->lnvm_ppa_list[i] = psl[i];
